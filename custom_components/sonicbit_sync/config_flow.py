@@ -29,7 +29,7 @@ STEP_USER_SCHEMA = vol.Schema(
 )
 
 
-def _test_credentials(email: str, password: str) -> None:
+def _test_credentials(email: str, password: str, config_dir: str) -> None:
     """Attempt to authenticate with SonicBit (blocking).
 
     Raises an exception if authentication fails so the config flow can
@@ -37,7 +37,10 @@ def _test_credentials(email: str, password: str) -> None:
     """
     from sonicbit import SonicBit  # noqa: PLC0415
 
-    client = SonicBit(email=email, password=password)
+    from .token_handler import HATokenHandler
+
+    handler = HATokenHandler(config_dir, "validation")
+    client = SonicBit(email=email, password=password, token_handler=handler)
     # A lightweight call to confirm credentials are accepted
     client.get_user_details()
 
@@ -63,6 +66,7 @@ class SonicBitConfigFlow(ConfigFlow, domain=DOMAIN):
                     _test_credentials,
                     user_input[CONF_EMAIL],
                     user_input[CONF_PASSWORD],
+                    self.hass.config.config_dir,
                 )
             except HomeAssistantError:
                 raise
