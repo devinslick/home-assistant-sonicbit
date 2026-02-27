@@ -1,0 +1,11 @@
+{
+  "domain": "sonicbit_sync",
+  "name": "SonicBit Media Sync",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/viperadnan-git/sonicbit-python-sdk",
+  "iot_class": "cloud_polling",
+  "requirements": ["sonicbit>=0.2.2", "httpx>=0.28.1"],
+  "version": "1.0.0"
+}
