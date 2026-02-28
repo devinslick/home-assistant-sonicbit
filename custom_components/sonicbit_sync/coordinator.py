@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,8 @@ import httpx
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CHUNK_SIZE,
@@ -30,6 +32,8 @@ from .token_handler import HATokenHandler
 
 _LOGGER = logging.getLogger(__name__)
 
+_STORE_VERSION = 1
+
 
 class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Polls the SonicBit API and orchestrates file transfers.
@@ -43,6 +47,8 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
       coordinator refresh cycle is never delayed.
     * A ``_downloading`` set prevents the same torrent from being queued
       twice while a transfer is already in progress.
+    * ``_completed_names`` persists across restarts so successfully-downloaded
+      folders are never deleted during stale-folder cleanup.
     """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -63,6 +69,16 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Public state read by sensor entities
         self.status: str = STATUS_IDLE
         self.storage_percent: float = 0.0
+
+        # Persistent store: tracks torrent names successfully downloaded by
+        # this integration so their local folders are never removed by cleanup.
+        # None means "not yet loaded from disk".
+        self._store = Store(
+            hass,
+            _STORE_VERSION,
+            f"{DOMAIN}_completed_{entry.entry_id}",
+        )
+        self._completed_names: set[str] | None = None
 
     # ------------------------------------------------------------------
     # SonicBit client – created once, reused thereafter
@@ -97,8 +113,19 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             storage = await self.hass.async_add_executor_job(self._fetch_storage)
             self.storage_percent = storage.percent
         except Exception as err:
+            # Log the error and surface it through the status sensor instead of
+            # raising UpdateFailed (which would make entities show "unavailable"
+            # rather than the more informative "Error" state).
+            _LOGGER.error("SonicBit API error: %s", err)
             self.status = STATUS_ERROR
-            raise UpdateFailed(f"SonicBit API error: {err}") from err
+            return {
+                "storage_percent": self.storage_percent,
+                "status": self.status,
+            }
+
+        # Storage fetch succeeded; clear a previous API-error status when idle.
+        if self.status == STATUS_ERROR and not self._downloading:
+            self.status = STATUS_IDLE
 
         # Trigger sync only when no download is already active
         if not self._downloading:
@@ -114,14 +141,24 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _trigger_sync(self) -> None:
-        """List completed torrents and queue downloads for new ones."""
+        """List torrents, clean up stale local folders, queue new downloads."""
         try:
-            completed = await self.hass.async_add_executor_job(
-                self._list_completed_torrents
+            all_torrents = await self.hass.async_add_executor_job(
+                self._list_all_torrents
             )
         except Exception as err:
             _LOGGER.error("Failed to list torrents: %s", err)
             return
+
+        completed = [t for t in all_torrents if t.progress == 100]
+        active_names = {t.name for t in all_torrents}
+
+        # Initialise persistent store on the first call
+        if self._completed_names is None:
+            await self._load_completed_names()
+
+        # Remove local folders whose torrents no longer exist on SonicBit
+        await self._cleanup_stale_folders(active_names)
 
         for torrent in completed:
             if torrent.hash not in self._downloading:
@@ -132,6 +169,74 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 self._downloading.add(torrent.hash)
                 self.hass.async_create_task(self._process_torrent(torrent))
+
+    async def _load_completed_names(self) -> None:
+        """Load completed-download names from the persistent store.
+
+        On the very first run (no store file yet) every existing local folder
+        is treated as "completed" so that pre-existing downloads are not
+        accidentally deleted by the new cleanup logic.
+        """
+        data = await self._store.async_load()
+        if data is not None:
+            self._completed_names = set(data.get("names", []))
+            _LOGGER.debug(
+                "Loaded %d completed torrent name(s) from store",
+                len(self._completed_names),
+            )
+        else:
+            # First run: seed from whatever is already on disk
+            existing = await self.hass.async_add_executor_job(
+                self._scan_local_folders
+            )
+            self._completed_names = existing
+            await self._store.async_save({"names": list(self._completed_names)})
+            _LOGGER.debug(
+                "Initialised completed-downloads store with %d existing folder(s)",
+                len(self._completed_names),
+            )
+
+    async def _cleanup_stale_folders(self, active_names: set[str]) -> None:
+        """Delete local folders for torrents no longer present on SonicBit.
+
+        A folder is considered stale when:
+        * its name does not match any torrent currently on SonicBit, AND
+        * it was not successfully downloaded by this integration (i.e. it is
+          not in ``_completed_names``).
+
+        This handles torrents that were deleted from SonicBit before the
+        integration finished downloading them, leaving behind partial folders.
+        Successfully completed downloads are always preserved.
+        """
+        storage_path = Path(self._storage_path)
+        path_exists = await self.hass.async_add_executor_job(storage_path.exists)
+        if not path_exists:
+            return
+
+        try:
+            subdirs = await self.hass.async_add_executor_job(
+                lambda: [p for p in storage_path.iterdir() if p.is_dir()]
+            )
+        except Exception as err:
+            _LOGGER.warning("Failed to scan storage directory: %s", err)
+            return
+
+        for folder in subdirs:
+            if folder.name in active_names:
+                continue  # Torrent still exists on SonicBit
+            if self._completed_names is not None and folder.name in self._completed_names:
+                continue  # Was fully downloaded by this integration
+
+            _LOGGER.info(
+                "Removing stale local folder '%s' (torrent no longer on SonicBit)",
+                folder.name,
+            )
+            try:
+                await self.hass.async_add_executor_job(shutil.rmtree, str(folder))
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to remove stale folder '%s': %s", folder.name, err
+                )
 
     async def _process_torrent(self, torrent) -> None:
         """Download all files for a torrent then delete the cloud copy.
@@ -175,6 +280,12 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.info(
                     "Transfer complete – deleted cloud copy of '%s'", torrent_name
                 )
+                # Record completion so the local folder is preserved by cleanup
+                if self._completed_names is not None:
+                    self._completed_names.add(torrent_name)
+                    await self._store.async_save(
+                        {"names": list(self._completed_names)}
+                    )
             else:
                 _LOGGER.warning(
                     "One or more files failed for '%s'; cloud copy retained",
@@ -275,16 +386,25 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _fetch_storage(self):
         return self._get_client().get_storage_details()
 
-    def _list_completed_torrents(self) -> list:
+    def _list_all_torrents(self) -> list:
         result = self._get_client().list_torrents()
         torrents = list(result.torrents.values())
-        completed = [t for t in torrents if t.progress == 100]
         _LOGGER.debug(
             "Polled SonicBit: %d torrent(s) total, %d completed",
             len(torrents),
-            len(completed),
+            len([t for t in torrents if t.progress == 100]),
         )
-        return completed
+        return torrents
+
+    def _scan_local_folders(self) -> set[str]:
+        """Return names of all subfolders in the storage path (blocking)."""
+        storage_path = Path(self._storage_path)
+        if not storage_path.exists():
+            return set()
+        try:
+            return {p.name for p in storage_path.iterdir() if p.is_dir()}
+        except Exception:
+            return set()
 
     def _get_torrent_details(self, torrent_hash: str):
         return self._get_client().get_torrent_details(torrent_hash)
