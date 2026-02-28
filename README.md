@@ -12,15 +12,25 @@ A [Home Assistant](https://www.home-assistant.io/) custom integration that autom
 - **Streaming downloads** — files are streamed in 8 MB chunks so multi-gigabyte transfers never spike HA's RAM
 - **Atomic writes** — files land as `.tmp` and are renamed to their final name only after a size check passes, so DLNA/media scanners never index a partial file
 - **Safe deletion** — the cloud copy is only deleted after every file in a torrent transfers successfully; failed downloads are retried on the next poll
-- **Three entities** — a storage sensor, a status sensor, and a force-sync button
+- **Auto-delete toggle** — a switch entity lets you enable or disable seedbox cleanup without reconfiguring the integration
+- **Four entities** — a storage sensor, a status sensor, a force-sync button, and an auto-delete switch
 
 ## Entities
 
-| Entity | Type | Description |
-|---|---|---|
-| `sensor.sonicbit_storage` | Sensor | Cloud storage used (%) |
-| `sensor.sonicbit_status` | Sensor | `Idle`, `Downloading`, or `Error` |
-| `button.sonicbit_force_sync` | Button | Trigger an immediate sync |
+| Entity | Type | Default | Description |
+|---|---|---|---|
+| `sensor.sonicbit_storage` | Sensor | — | Cloud storage used (%) |
+| `sensor.sonicbit_status` | Sensor | — | `Idle`, `Downloading`, or `Error` |
+| `button.sonicbit_force_sync` | Button | — | Trigger an immediate sync |
+| `switch.sonicbit_auto_delete` | Switch | On | Delete the seedbox copy after a successful download |
+
+### Auto-Delete Switch
+
+When **on** (default), the integration deletes each torrent and its cloud files from SonicBit immediately after all local files are verified. When **off**, files are still downloaded to local storage but the seedbox copy is left untouched.
+
+Turning the switch back **on** will cause any already-downloaded-but-not-yet-deleted torrents to be cleaned up on the next poll (within 60 seconds) — no manual action required.
+
+The switch state is persisted across Home Assistant restarts.
 
 ## Requirements
 
@@ -82,6 +92,7 @@ If you run HA in **Docker** or **supervised**, ensure the path you configure is 
 | Files not appearing | Confirm the storage path exists and is writable: `ls -la /media/sonicbit` |
 | Credentials rejected | Re-authenticate via the integration's **Configure** button in Devices & Services |
 | Partial `.tmp` files | A previous download was interrupted; they will be cleaned up on the next successful run |
+| Cloud copy not deleted | Check that `switch.sonicbit_auto_delete` is **on**; also check logs for deletion errors |
 
 ## Contributing
 

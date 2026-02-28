@@ -66,9 +66,10 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._client = None  # Lazy-initialised in executor thread
         self._downloading: set[str] = set()
 
-        # Public state read by sensor entities
+        # Public state read by sensor/switch entities
         self.status: str = STATUS_IDLE
         self.storage_percent: float = 0.0
+        self.auto_delete: bool = True
 
         # Persistent store: tracks torrent names successfully downloaded by
         # this integration so their local folders are never removed by cleanup.
@@ -274,13 +275,59 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     all_ok = False
 
             if all_ok:
-                await self.hass.async_add_executor_job(
-                    self._delete_torrent, torrent_hash
-                )
-                _LOGGER.info(
-                    "Transfer complete – deleted cloud copy of '%s'", torrent_name
-                )
-                # Record completion so the local folder is preserved by cleanup
+                if self.auto_delete:
+                    _LOGGER.info(
+                        "All files downloaded for '%s'; deleting seedbox copy (hash=%s)",
+                        torrent_name,
+                        torrent_hash,
+                    )
+                    # Step 1: remove from the BitTorrent queue. If this fails
+                    # the torrent remains in the list and will be retried next poll.
+                    try:
+                        await self.hass.async_add_executor_job(
+                            self._delete_torrent, torrent_hash
+                        )
+                    except Exception as del_err:
+                        _LOGGER.error(
+                            "Failed to remove torrent queue entry for '%s' (hash=%s): %s"
+                            " – will retry next poll",
+                            torrent_name,
+                            torrent_hash,
+                            del_err,
+                        )
+                        all_ok = False
+                    else:
+                        # Step 2: delete the file/folder from My Drive. If this
+                        # fails the queue entry is already gone so we can't
+                        # auto-retry; log clearly and fall through to record
+                        # completion so the local folder is not cleaned up.
+                        try:
+                            await self.hass.async_add_executor_job(
+                                self._delete_drive_entry, torrent_name
+                            )
+                            _LOGGER.info(
+                                "Transfer complete – deleted cloud copy of '%s'",
+                                torrent_name,
+                            )
+                        except Exception as drive_err:
+                            _LOGGER.error(
+                                "Removed torrent queue entry for '%s' but failed to"
+                                " delete My Drive files: %s – manual cleanup may be required",
+                                torrent_name,
+                                drive_err,
+                            )
+                            all_ok = False
+                else:
+                    _LOGGER.info(
+                        "All files downloaded for '%s'; auto-delete is off, keeping cloud copy",
+                        torrent_name,
+                    )
+
+                # Record completion so the local folder is preserved by stale-folder
+                # cleanup. This runs whenever downloads succeeded (we are inside the
+                # outer `if all_ok` block), including the case where My Drive deletion
+                # failed after a successful queue removal – the torrent won't appear in
+                # the list on the next poll so we must protect the folder now.
                 if self._completed_names is not None:
                     self._completed_names.add(torrent_name)
                     await self._store.async_save(
@@ -410,7 +457,36 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._get_client().get_torrent_details(torrent_hash)
 
     def _delete_torrent(self, torrent_hash: str) -> None:
-        self._get_client().delete_torrent(torrent_hash, with_file=True)
+        # with_file=False because My Drive files are handled by _delete_drive_folder.
+        self._get_client().delete_torrent(torrent_hash, with_file=False)
+
+    def _delete_drive_entry(self, torrent_name: str) -> None:
+        """Delete the torrent's file or folder from My Drive via the file manager API.
+
+        delete_torrent() only removes the entry from the BitTorrent queue.
+        The actual content lives in a separate cloud file manager ("My Drive")
+        and must be removed with an explicit list_files / delete_file call.
+
+        Multi-file torrents land as a folder; single-file torrents land as a
+        bare file at the root – both are handled by checking is_directory.
+        """
+        from sonicbit.types.path_info import PathInfo as SBPathInfo  # noqa: PLC0415
+
+        client = self._get_client()
+        file_list = client.list_files(SBPathInfo.root())
+        for item in file_list.items:
+            if item.name == torrent_name:
+                client.delete_file(item, is_directory=item.is_directory)
+                _LOGGER.debug(
+                    "Deleted My Drive %s '%s'",
+                    "folder" if item.is_directory else "file",
+                    torrent_name,
+                )
+                return
+        _LOGGER.debug(
+            "No My Drive entry named '%s' found at root (already gone or path differs)",
+            torrent_name,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
