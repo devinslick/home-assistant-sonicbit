@@ -8,6 +8,6 @@
   "issue_tracker": "https://github.com/devinslick/home-assistant-sonicbit/issues",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "requirements": ["sonicbit @ git+https://github.com/viperadnan-git/sonicbit-python-sdk.git", "httpx>=0.28.1"],
+  "requirements": ["sonicbit @ git+https://github.com/devinslick/sonicbit-python-sdk.git", "httpx>=0.28.1"],
   "version": "1.0.0"
 }

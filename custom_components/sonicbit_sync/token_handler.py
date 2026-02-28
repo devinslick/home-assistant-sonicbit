@@ -6,10 +6,13 @@ import json
 import logging
 import os
 
+from sonicbit.handlers.token_handler import TokenHandler
+from sonicbit.models import AuthResponse
+
 _LOGGER = logging.getLogger(__name__)
 
 
-class HATokenHandler:
+class HATokenHandler(TokenHandler):
     """Stores SonicBit auth tokens in the HA config directory.
 
     This replaces the default TokenFileHandler (which writes to the
@@ -18,6 +21,7 @@ class HATokenHandler:
     """
 
     def __init__(self, config_dir: str, entry_id: str) -> None:
+        super().__init__()
         self._path = os.path.join(config_dir, f".sonicbit_token_{entry_id}.json")
 
     def read(self, email: str) -> str | None:
@@ -29,10 +33,10 @@ class HATokenHandler:
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
-    def write(self, email: str, token: str) -> None:
-        """Persist *token* for *email* to disk."""
+    def write(self, email: str, auth: AuthResponse) -> None:
+        """Persist the token from *auth* for *email* to disk."""
         try:
             with open(self._path, "w") as fh:
-                json.dump({email: token}, fh)
+                json.dump({email: auth.token}, fh)
         except OSError as err:
             _LOGGER.warning("Could not write SonicBit token cache: %s", err)

@@ -93,4 +93,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 
-Uses the unofficial [sonicbit](https://pypi.org/project/sonicbit/) Python SDK by [viperadnan-git](https://github.com/viperadnan-git/sonicbit-python-sdk).
+Uses the unofficial [sonicbit](https://github.com/devinslick/sonicbit-python-sdk) Python SDK by [devinslick](https://github.com/devinslick/sonicbit-python-sdk).
