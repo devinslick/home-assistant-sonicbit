@@ -277,10 +277,11 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _list_completed_torrents(self) -> list:
         result = self._get_client().list_torrents()
-        completed = [t for t in result if t.progress == 100]
+        torrents = list(result.torrents.values())
+        completed = [t for t in torrents if t.progress == 100]
         _LOGGER.debug(
             "Polled SonicBit: %d torrent(s) total, %d completed",
-            len(list(result)) if hasattr(result, '__len__') else 0,
+            len(torrents),
             len(completed),
         )
         return completed
