@@ -470,10 +470,8 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Multi-file torrents land as a folder; single-file torrents land as a
         bare file at the root – both are handled by checking is_directory.
         """
-        from sonicbit.types.path_info import PathInfo as SBPathInfo  # noqa: PLC0415
-
         client = self._get_client()
-        file_list = client.list_files(SBPathInfo.root())
+        file_list = client.list_files()  # no arg → default PathInfo.root()
         for item in file_list.items:
             if item.name == torrent_name:
                 client.delete_file(item, is_directory=item.is_directory)
