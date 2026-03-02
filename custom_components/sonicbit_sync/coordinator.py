@@ -118,7 +118,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         the model layout has changed.
         """
         try:
-            from sonicbit.types.torrent import torrent_info as _ti  # noqa: PLC0415
+            from sonicbit.models.torrent import torrent_info as _ti  # noqa: PLC0415
 
             cls = _ti.TorrentInfo
             # Only patch Pydantic v2 BaseModel subclasses
