@@ -346,13 +346,12 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 torrent_name,
                             )
                         except Exception as drive_err:
-                            _LOGGER.error(
+                            _LOGGER.warning(
                                 "Removed torrent queue entry for '%s' but failed to"
                                 " delete My Drive files: %s – manual cleanup may be required",
                                 torrent_name,
                                 drive_err,
                             )
-                            all_ok = False
                 else:
                     _LOGGER.info(
                         "All files downloaded for '%s'; auto-delete is off, keeping cloud copy",
