@@ -93,6 +93,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._client is None:
             from sonicbit import SonicBit  # noqa: PLC0415
 
+            self._patch_sonicbit_models()
             handler = HATokenHandler(
                 self.hass.config.config_dir,
                 self._entry.entry_id,
@@ -103,6 +104,35 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 token_handler=handler,
             )
         return self._client
+
+    @staticmethod
+    def _patch_sonicbit_models() -> None:
+        """Work around sonicbit's TorrentInfo.upload_rate being typed as str
+        while the live API returns int or float values.
+
+        The sonicbit Pydantic model enforces ``upload_rate: str``, but the
+        SonicBit API returns raw numbers (e.g. 0, 150.27).  Enabling Pydantic's
+        ``coerce_numbers_to_str`` on that model makes the validation pass without
+        modifying any library files.  The patch is guarded so it runs at most once
+        and silently skips if the model layout has changed.
+        """
+        try:
+            from sonicbit.types.torrent import torrent_info as _ti  # noqa: PLC0415
+
+            cls = _ti.TorrentInfo
+            # Only patch Pydantic v2 BaseModel subclasses
+            if not hasattr(cls, "model_fields") or not hasattr(cls, "model_rebuild"):
+                return
+            if getattr(cls, "_upload_rate_coerce_patched", False):
+                return
+
+            from pydantic import ConfigDict  # noqa: PLC0415
+
+            cls.model_config = ConfigDict(coerce_numbers_to_str=True)
+            cls.model_rebuild(force=True)
+            cls._upload_rate_coerce_patched = True  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("Could not patch sonicbit TorrentInfo model: %s", exc)
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator hook – runs every POLL_INTERVAL seconds
