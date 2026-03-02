@@ -111,10 +111,11 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         while the live API returns int or float values.
 
         The sonicbit Pydantic model enforces ``upload_rate: str``, but the
-        SonicBit API returns raw numbers (e.g. 0, 150.27).  Enabling Pydantic's
-        ``coerce_numbers_to_str`` on that model makes the validation pass without
-        modifying any library files.  The patch is guarded so it runs at most once
-        and silently skips if the model layout has changed.
+        SonicBit API returns raw numbers (e.g. 0, 150.27).  We inject a
+        Pydantic v2 BeforeValidator into the field annotation so that any
+        numeric value is converted to a string before the type check runs.
+        The patch is guarded so it runs at most once and silently skips if
+        the model layout has changed.
         """
         try:
             from sonicbit.types.torrent import torrent_info as _ti  # noqa: PLC0415
@@ -125,10 +126,19 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             if getattr(cls, "_upload_rate_coerce_patched", False):
                 return
+            if "upload_rate" not in getattr(cls, "__annotations__", {}):
+                return
 
-            from pydantic import ConfigDict  # noqa: PLC0415
+            import typing  # noqa: PLC0415
 
-            cls.model_config = ConfigDict(coerce_numbers_to_str=True)
+            from pydantic.functional_validators import BeforeValidator  # noqa: PLC0415
+
+            cls.__annotations__["upload_rate"] = typing.Annotated[
+                str,
+                BeforeValidator(
+                    lambda v: str(v) if isinstance(v, (int, float)) else v
+                ),
+            ]
             cls.model_rebuild(force=True)
             cls._upload_rate_coerce_patched = True  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001
