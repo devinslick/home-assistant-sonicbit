@@ -9,6 +9,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import time
+
 import httpx
 
 from homeassistant.config_entries import ConfigEntry
@@ -33,6 +35,15 @@ from .token_handler import HATokenHandler
 _LOGGER = logging.getLogger(__name__)
 
 _STORE_VERSION = 1
+
+# How many consecutive poll failures must occur before STATUS_ERROR is set.
+# A single transient network blip won't flip the sensor to error state.
+_API_ERROR_THRESHOLD = 3
+
+# Retry settings for streaming file downloads.
+_DOWNLOAD_MAX_RETRIES = 3
+# Exceptions considered transient for download retries (transport-level only).
+_DOWNLOAD_RETRY_EXC = (httpx.TransportError,)
 
 
 class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -65,6 +76,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._client = None  # Lazy-initialised in executor thread
         self._downloading: set[str] = set()
+        self._consecutive_api_errors: int = 0
 
         # Public state read by sensor/switch entities
         self.status: str = STATUS_IDLE
@@ -149,12 +161,26 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             storage = await self.hass.async_add_executor_job(self._fetch_storage)
             self.storage_percent = storage.percent
+            self._consecutive_api_errors = 0
         except Exception as err:
-            # Log the error and surface it through the status sensor instead of
-            # raising UpdateFailed (which would make entities show "unavailable"
-            # rather than the more informative "Error" state).
-            _LOGGER.error("SonicBit API error: %s", err)
-            self.status = STATUS_ERROR
+            self._consecutive_api_errors += 1
+            if self._consecutive_api_errors < _API_ERROR_THRESHOLD:
+                # Transient blip – warn and keep the current status so the
+                # sensor doesn't flicker to Error on a single dropped packet.
+                _LOGGER.warning(
+                    "SonicBit API error (attempt %d/%d, will retry next poll): %s",
+                    self._consecutive_api_errors,
+                    _API_ERROR_THRESHOLD,
+                    err,
+                )
+            else:
+                # Sustained failure – surface as an error.
+                _LOGGER.error(
+                    "SonicBit API error (%d consecutive failures): %s",
+                    self._consecutive_api_errors,
+                    err,
+                )
+                self.status = STATUS_ERROR
             return {
                 "storage_percent": self.storage_percent,
                 "status": self.status,
@@ -435,31 +461,47 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         that multi-gigabyte files are written chunk-by-chunk and never held
         in RAM all at once.
 
-        Raises an exception on size mismatch; the .tmp file is removed
-        before raising so no partial artefacts are left behind.
+        Transport-level errors (connection drops, timeouts) are retried up to
+        _DOWNLOAD_MAX_RETRIES times with exponential backoff (2 s, 4 s, 8 s).
+        The .tmp file is removed before each retry so partial artefacts are
+        never left behind.  Non-transient errors (HTTP 4xx, size mismatch)
+        are raised immediately without retrying.
         """
-        try:
-            with httpx.stream("GET", url, timeout=httpx.Timeout(10.0, read=None)) as resp:
-                resp.raise_for_status()
-                with open(tmp_path, "wb") as fh:
-                    for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
-                        fh.write(chunk)
+        for attempt in range(1, _DOWNLOAD_MAX_RETRIES + 1):
+            try:
+                with httpx.stream("GET", url, timeout=httpx.Timeout(10.0, read=None)) as resp:
+                    resp.raise_for_status()
+                    with open(tmp_path, "wb") as fh:
+                        for chunk in resp.iter_bytes(chunk_size=CHUNK_SIZE):
+                            fh.write(chunk)
 
-            actual_size = os.path.getsize(tmp_path)
-            if actual_size != expected_size:
-                raise ValueError(
-                    f"Size mismatch for '{tmp_path.name}': "
-                    f"downloaded {actual_size:,} bytes, expected {expected_size:,}"
+                actual_size = os.path.getsize(tmp_path)
+                if actual_size != expected_size:
+                    raise ValueError(
+                        f"Size mismatch for '{tmp_path.name}': "
+                        f"downloaded {actual_size:,} bytes, expected {expected_size:,}"
+                    )
+
+                # Atomic rename – the file is only visible to scanners once complete
+                tmp_path.rename(final_path)
+                _LOGGER.info("Saved: %s", final_path)
+                return
+
+            except Exception as exc:
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+                if not isinstance(exc, _DOWNLOAD_RETRY_EXC) or attempt == _DOWNLOAD_MAX_RETRIES:
+                    raise
+                wait = 2 ** attempt  # 2 s, 4 s, 8 s
+                _LOGGER.warning(
+                    "Download of '%s' failed (attempt %d/%d, retrying in %ds): %s",
+                    tmp_path.name,
+                    attempt,
+                    _DOWNLOAD_MAX_RETRIES,
+                    wait,
+                    exc,
                 )
-
-            # Atomic rename – the file is only visible to scanners once complete
-            tmp_path.rename(final_path)
-            _LOGGER.info("Saved: %s", final_path)
-
-        except Exception:
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-            raise
+                time.sleep(wait)
 
     # ------------------------------------------------------------------
     # Thin executor wrappers around synchronous SDK calls
