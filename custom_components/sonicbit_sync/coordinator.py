@@ -109,6 +109,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if self._client is None:
             from sonicbit import SonicBit  # noqa: PLC0415
+            from sonicbit.constants import Constants  # noqa: PLC0415
 
             self._patch_sonicbit_models()
             handler = HATokenHandler(
@@ -120,6 +121,20 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 password=self._password,
                 token_handler=handler,
             )
+            # Auth.login() is a @staticmethod that uses a one-off httpx.request()
+            # call, so the server's Set-Cookie headers are never stored in the
+            # shared httpx.Client session.  The /api/file-manager endpoint needs
+            # those cookies.  Repeating the login through self._client.session
+            # populates the cookie jar; the httpx.Client then sends the cookies
+            # automatically on every subsequent request to the same origin.
+            try:
+                self._client.session.post(
+                    SonicBitBase.url("/web/login"),
+                    json={"email": self._email, "password": self._password},
+                    headers=Constants.API_HEADERS,
+                )
+            except Exception:
+                pass  # non-fatal; Bearer token still works for all other endpoints
         return self._client
 
     @staticmethod
@@ -373,28 +388,42 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         torrent_name,
                         torrent_hash,
                     )
-                    # Delete the torrent queue entry AND the seedbox files in one
-                    # call (with_file=True). My Drive is a view over the same
-                    # seedbox storage, so the file disappears there automatically.
-                    # If this fails the torrent remains in the list and will be
-                    # retried on the next poll.
+                    # Step 1: remove the torrent queue entry AND the seedbox
+                    # download files.  If this fails the torrent remains in the
+                    # list and will be retried on the next poll.
                     try:
                         await self.hass.async_add_executor_job(
                             self._delete_torrent, torrent_hash
                         )
-                        _LOGGER.info(
-                            "Transfer complete – deleted cloud copy of '%s'",
-                            torrent_name,
-                        )
                     except Exception as del_err:
                         _LOGGER.error(
-                            "Failed to delete cloud copy of '%s' (hash=%s): %s"
+                            "Failed to remove torrent queue entry for '%s' (hash=%s): %s"
                             " – will retry next poll",
                             torrent_name,
                             torrent_hash,
                             del_err,
                         )
                         all_ok = False
+                    else:
+                        # Step 2: delete the file/folder from My Drive.  The
+                        # queue entry is already gone so we can't auto-retry;
+                        # log clearly and fall through so the local folder is
+                        # protected from stale-folder cleanup.
+                        try:
+                            await self.hass.async_add_executor_job(
+                                self._delete_drive_entry, torrent_name
+                            )
+                            _LOGGER.info(
+                                "Transfer complete – deleted cloud copy of '%s'",
+                                torrent_name,
+                            )
+                        except Exception as drive_err:
+                            _LOGGER.warning(
+                                "Removed torrent queue entry for '%s' but failed to"
+                                " delete My Drive files: %s – manual cleanup may be required",
+                                torrent_name,
+                                drive_err,
+                            )
                 else:
                     _LOGGER.info(
                         "All files downloaded for '%s'; auto-delete is off, keeping cloud copy",
@@ -573,11 +602,40 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._get_client().get_torrent_details(torrent_hash)
 
     def _delete_torrent(self, torrent_hash: str) -> None:
-        # with_file=True tells SonicBit to delete both the torrent queue entry
-        # and the downloaded files from seedbox storage in a single API call.
-        # My Drive is a view over that same storage, so the file disappears
-        # there too without needing the broken /api/file-manager endpoint.
+        # with_file=True removes the queue entry AND the seedbox download files.
+        # My Drive is a separate storage layer cleaned up by _delete_drive_entry.
         self._get_client().delete_torrent(torrent_hash, with_file=True)
+
+    def _delete_drive_entry(self, torrent_name: str) -> None:
+        """Delete the torrent's file or folder from My Drive via the file manager API.
+
+        The /api/file-manager endpoint needs the web session cookie that is
+        populated by the session-based login performed in _get_client().
+        """
+        client = self._get_client()
+        try:
+            file_list = client.list_files()
+        except Exception as err:
+            _LOGGER.warning(
+                "Could not list My Drive to delete '%s'; skipping drive cleanup: %s",
+                torrent_name,
+                err,
+            )
+            return
+
+        for item in file_list.items:
+            if item.name == torrent_name:
+                client.delete_file(item, is_directory=item.is_directory)
+                _LOGGER.debug(
+                    "Deleted My Drive %s '%s'",
+                    "folder" if item.is_directory else "file",
+                    torrent_name,
+                )
+                return
+        _LOGGER.debug(
+            "No My Drive entry named '%s' found at root (already gone or path differs)",
+            torrent_name,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
