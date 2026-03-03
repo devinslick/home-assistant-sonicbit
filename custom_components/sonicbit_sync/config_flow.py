@@ -13,6 +13,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_REMOTE_FOLDER,
     CONF_STORAGE_PATH,
     DEFAULT_STORAGE_PATH,
     DOMAIN,
@@ -25,6 +26,7 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Required(CONF_EMAIL): str,
         vol.Required(CONF_PASSWORD): str,
         vol.Optional(CONF_STORAGE_PATH, default=DEFAULT_STORAGE_PATH): str,
+        vol.Optional(CONF_REMOTE_FOLDER, default=""): str,
     }
 )
 

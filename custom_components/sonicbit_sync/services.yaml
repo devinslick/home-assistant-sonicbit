@@ -1,0 +1,19 @@
+add_torrent:
+  name: Add Torrent
+  description: >
+    Add a new torrent to the SonicBit seedbox. Accepts a magnet link,
+    a URL to a remote .torrent file, or an absolute path to a local
+    .torrent file on the Home Assistant host. If a remote folder is
+    configured in the integration settings, the torrent is placed there
+    and will be picked up by the scoped sync automatically.
+  fields:
+    uri:
+      name: URI
+      description: >
+        Magnet link (magnet:?xt=…), HTTPS URL to a .torrent file, or
+        absolute local path to a .torrent file on the HA host
+        (e.g. /config/downloads/file.torrent).
+      required: true
+      example: "magnet:?xt=urn:btih:abc123&dn=MyTorrent"
+      selector:
+        text:

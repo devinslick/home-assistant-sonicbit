@@ -6,6 +6,7 @@ DOMAIN = "sonicbit_sync"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_STORAGE_PATH = "storage_path"
+CONF_REMOTE_FOLDER = "remote_folder"
 
 # Defaults
 DEFAULT_STORAGE_PATH = "/media/sonicbit"
