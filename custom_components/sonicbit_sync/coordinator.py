@@ -551,12 +551,25 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return set()
 
     def _list_remote_folder_names(self) -> set[str]:
-        """Return names of items in the configured My Drive remote folder (blocking)."""
-        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+        """Return names of items in the configured My Drive remote folder (blocking).
 
-        path = PathInfo.from_path_key(self._remote_folder)
-        file_list = self._get_client().list_files(path)
-        return {item.name for item in file_list.items}
+        Navigates from root by display name rather than constructing a PathInfo
+        from the user-supplied string.  The ``list_files`` API requires the
+        server-assigned key embedded in each item's ``path_info``; using the
+        folder's display name as the key directly causes the server to return a
+        non-JSON response.
+        """
+        client = self._get_client()
+        root_items = client.list_files().items
+        for item in root_items:
+            if item.name == self._remote_folder and item.is_directory:
+                folder_contents = client.list_files(path=item.path_info)
+                return {f.name for f in folder_contents.items}
+        _LOGGER.debug(
+            "Remote folder '%s' not found in My Drive root; treating as empty",
+            self._remote_folder,
+        )
+        return set()
 
     def _add_torrent_uri(self, uri: str) -> None:
         """Add a torrent by magnet link or .torrent URL (blocking)."""
@@ -598,17 +611,29 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Multi-file torrents land as a folder; single-file torrents land as a
         bare file – both are handled by checking is_directory.  When a remote
-        folder is configured, that folder is listed instead of the root.
+        folder is configured the listing is scoped to that folder; the folder
+        is located by display name from root so the server-assigned key is used.
         """
-        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
-
         client = self._get_client()
-        path = (
-            PathInfo.from_path_key(self._remote_folder)
-            if self._remote_folder
-            else PathInfo.root()
-        )
-        file_list = client.list_files(path)
+
+        if self._remote_folder:
+            # Locate the remote folder by display name from root first.
+            root_items = client.list_files().items
+            remote_dir = next(
+                (f for f in root_items if f.name == self._remote_folder and f.is_directory),
+                None,
+            )
+            if remote_dir is None:
+                _LOGGER.debug(
+                    "Remote folder '%s' not found; cannot delete '%s'",
+                    self._remote_folder,
+                    torrent_name,
+                )
+                return
+            file_list = client.list_files(path=remote_dir.path_info)
+        else:
+            file_list = client.list_files()
+
         for item in file_list.items:
             if item.name == torrent_name:
                 client.delete_file(item, is_directory=item.is_directory)
