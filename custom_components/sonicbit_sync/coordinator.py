@@ -22,6 +22,7 @@ from .const import (
     CHUNK_SIZE,
     CONF_EMAIL,
     CONF_PASSWORD,
+    CONF_REMOTE_FOLDER,
     CONF_STORAGE_PATH,
     DEFAULT_STORAGE_PATH,
     DOMAIN,
@@ -73,6 +74,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._email: str = entry.data[CONF_EMAIL]
         self._password: str = entry.data[CONF_PASSWORD]
         self._storage_path: str = entry.data.get(CONF_STORAGE_PATH, DEFAULT_STORAGE_PATH)
+        self._remote_folder: str = entry.data.get(CONF_REMOTE_FOLDER, "")
 
         self._client = None  # Lazy-initialised in executor thread
         self._downloading: set[str] = set()
@@ -214,6 +216,24 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         completed = [t for t in all_torrents if t.progress == 100]
+
+        if self._remote_folder and completed:
+            # Scope to only torrents present in the configured My Drive folder.
+            # The folder listing is the source of truth: only files that SonicBit
+            # has moved there (after completing) will be synced locally.
+            try:
+                folder_names = await self.hass.async_add_executor_job(
+                    self._list_remote_folder_names
+                )
+                completed = [t for t in completed if t.name in folder_names]
+            except Exception as err:
+                _LOGGER.warning(
+                    "Could not list remote folder '%s'; skipping sync this cycle: %s",
+                    self._remote_folder,
+                    err,
+                )
+                return
+
         active_names = {t.name for t in all_torrents}
 
         # Initialise persistent store on the first call
@@ -530,6 +550,38 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:
             return set()
 
+    def _list_remote_folder_names(self) -> set[str]:
+        """Return names of items in the configured My Drive remote folder (blocking)."""
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+
+        path = PathInfo.from_path_key(self._remote_folder)
+        file_list = self._get_client().list_files(path)
+        return {item.name for item in file_list.items}
+
+    def _add_torrent_uri(self, uri: str) -> None:
+        """Add a torrent by magnet link or .torrent URL (blocking)."""
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+
+        path = (
+            PathInfo.from_path_key(self._remote_folder)
+            if self._remote_folder
+            else PathInfo.root()
+        )
+        self._get_client().add_torrent(uri, path=path)
+        _LOGGER.info("Added torrent URI to SonicBit: %s", uri)
+
+    def _add_torrent_file(self, file_path: str) -> None:
+        """Upload a local .torrent file to SonicBit (blocking)."""
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+
+        path = (
+            PathInfo.from_path_key(self._remote_folder)
+            if self._remote_folder
+            else PathInfo.root()
+        )
+        self._get_client().add_torrent_file(file_path, path=path)
+        _LOGGER.info("Added torrent file to SonicBit: %s", file_path)
+
     def _get_torrent_details(self, torrent_hash: str):
         return self._get_client().get_torrent_details(torrent_hash)
 
@@ -545,10 +597,18 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         and must be removed with an explicit list_files / delete_file call.
 
         Multi-file torrents land as a folder; single-file torrents land as a
-        bare file at the root – both are handled by checking is_directory.
+        bare file – both are handled by checking is_directory.  When a remote
+        folder is configured, that folder is listed instead of the root.
         """
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+
         client = self._get_client()
-        file_list = client.list_files()  # no arg → default PathInfo.root()
+        path = (
+            PathInfo.from_path_key(self._remote_folder)
+            if self._remote_folder
+            else PathInfo.root()
+        )
+        file_list = client.list_files(path)
         for item in file_list.items:
             if item.name == torrent_name:
                 client.delete_file(item, is_directory=item.is_directory)
@@ -559,8 +619,9 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
         _LOGGER.debug(
-            "No My Drive entry named '%s' found at root (already gone or path differs)",
+            "No My Drive entry named '%s' found%s (already gone or path differs)",
             torrent_name,
+            f" in folder '{self._remote_folder}'" if self._remote_folder else " at root",
         )
 
     # ------------------------------------------------------------------
@@ -583,3 +644,21 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._trigger_sync()
         else:
             _LOGGER.info("Sync already in progress; ignoring manual trigger")
+
+    async def async_add_torrent(self, uri: str) -> None:
+        """Add a torrent to SonicBit by magnet link, .torrent URL, or local file path.
+
+        The ``uri`` is dispatched to the appropriate SDK call:
+        * Paths starting with ``/`` are treated as local ``.torrent`` files and
+          uploaded via ``add_torrent_file``.
+        * Everything else (``magnet:`` links, ``http(s)://`` URLs) is passed
+          directly to ``add_torrent``.
+
+        If a remote folder is configured the torrent is placed in that folder
+        on SonicBit's My Drive so the integration's folder-scoped sync picks
+        it up automatically.
+        """
+        if uri.startswith("/"):
+            await self.hass.async_add_executor_job(self._add_torrent_file, uri)
+        else:
+            await self.hass.async_add_executor_job(self._add_torrent_uri, uri)

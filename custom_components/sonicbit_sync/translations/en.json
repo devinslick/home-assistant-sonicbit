@@ -7,10 +7,12 @@
         "data": {
           "email": "SonicBit Email",
           "password": "SonicBit Password",
-          "storage_path": "Local Storage Path"
+          "storage_path": "Local Storage Path",
+          "remote_folder": "SonicBit Remote Folder (optional)"
         },
         "data_description": {
-          "storage_path": "Absolute path on the host where files will be saved (e.g. /media/sonicbit). Must be writable by the Home Assistant process."
+          "storage_path": "Absolute path on the host where files will be saved (e.g. /media/sonicbit). Must be writable by the Home Assistant process.",
+          "remote_folder": "Folder name on SonicBit My Drive where torrents added via this integration will be stored (e.g. from-ha). When set, only torrents in this folder are synced locally. Leave empty to sync all completed torrents."
         }
       }
     },
@@ -19,6 +21,18 @@
     },
     "abort": {
       "already_configured": "This SonicBit account is already configured."
+    }
+  },
+  "services": {
+    "add_torrent": {
+      "name": "Add Torrent",
+      "description": "Add a new torrent to the SonicBit seedbox. Accepts a magnet link, a URL to a .torrent file, or an absolute path to a local .torrent file on the Home Assistant host.",
+      "fields": {
+        "uri": {
+          "name": "URI",
+          "description": "Magnet link (magnet:?xt=…), URL to a remote .torrent file (https://…), or absolute local path to a .torrent file (/config/downloads/file.torrent)."
+        }
+      }
     }
   }
 }
