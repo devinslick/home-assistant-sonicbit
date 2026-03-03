@@ -125,17 +125,34 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # call, so the server's Set-Cookie headers are never stored in the
             # shared httpx.Client session.  The /api/file-manager endpoint needs
             # those cookies.  Repeating the login through self._client.session
-            # populates the cookie jar; the httpx.Client then sends the cookies
-            # automatically on every subsequent request to the same origin.
-            try:
-                self._client.session.post(
-                    SonicBitBase.url("/web/login"),
-                    json={"email": self._email, "password": self._password},
-                    headers=Constants.API_HEADERS,
-                )
-            except Exception:
-                pass  # non-fatal; Bearer token still works for all other endpoints
+            # populates the cookie jar; the requests.Session then sends the
+            # cookies automatically on every subsequent request to the same origin.
+            self._refresh_web_session()
         return self._client
+
+    def _refresh_web_session(self) -> None:
+        """(Re-)authenticate the web session cookie used by /api/file-manager.
+
+        Called once during client initialisation and again whenever the session
+        cookie appears to have expired (detected by an InvalidResponseError from
+        list_files()).  Must be called from an executor thread only.
+        """
+        if self._client is None:
+            return
+        from sonicbit.constants import Constants  # noqa: PLC0415
+
+        try:
+            self._client.session.post(
+                SonicBitBase.url("/web/login"),
+                json={"email": self._email, "password": self._password},
+                headers=Constants.API_HEADERS,
+            )
+            _LOGGER.debug("Web session cookie refreshed successfully")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "Web session refresh failed (non-fatal, Bearer token still works): %s",
+                err,
+            )
 
     @staticmethod
     def _patch_sonicbit_models() -> None:
@@ -610,11 +627,29 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Delete the torrent's file or folder from My Drive via the file manager API.
 
         The /api/file-manager endpoint needs the web session cookie that is
-        populated by the session-based login performed in _get_client().
+        populated by the session-based login performed in _get_client().  If the
+        session cookie has expired since the client was created, list_files() will
+        receive a non-JSON response (login redirect / empty body) and raise
+        InvalidResponseError.  In that case we re-authenticate and retry once.
         """
+        from sonicbit.errors import InvalidResponseError  # noqa: PLC0415
+
         client = self._get_client()
+
+        def _list_with_session_retry() -> object:
+            """Call list_files(); on InvalidResponseError refresh the session and retry."""
+            try:
+                return client.list_files()
+            except InvalidResponseError:
+                _LOGGER.debug(
+                    "list_files() returned invalid JSON – session cookie likely expired; "
+                    "refreshing web session and retrying"
+                )
+                self._refresh_web_session()
+                return client.list_files()  # let any second failure propagate
+
         try:
-            file_list = client.list_files()
+            file_list = _list_with_session_retry()
         except Exception as err:
             _LOGGER.warning(
                 "Could not list My Drive to delete '%s'; skipping drive cleanup: %s",
