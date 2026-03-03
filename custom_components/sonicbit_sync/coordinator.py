@@ -668,9 +668,19 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._managed_hashes is None:
             await self._load_completed_names()
 
-        # Snapshot existing hashes so we can detect the newly added one(s).
+        # For magnet links the infohash is embedded in the URI itself, so we
+        # extract it directly instead of relying on a before/after list_torrents()
+        # diff (which fails because the torrent takes time to appear in the queue).
+        extracted_hash: str | None = None
+        if self._remote_folder and uri.startswith("magnet:"):
+            import re  # noqa: PLC0415
+            m = re.search(r"xt=urn:btih:([0-9a-fA-F]{40})", uri, re.IGNORECASE)
+            if m:
+                extracted_hash = m.group(1).lower()
+
+        # Snapshot existing hashes for the diff fallback (non-magnet URIs only).
         before_hashes: set[str] = set()
-        if self._remote_folder:
+        if self._remote_folder and extracted_hash is None:
             before = await self.hass.async_add_executor_job(self._list_all_torrents)
             before_hashes = {t.hash.lower() for t in before}
 
@@ -680,19 +690,25 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.hass.async_add_executor_job(self._add_torrent_uri, uri)
 
         if self._remote_folder:
-            after = await self.hass.async_add_executor_job(self._list_all_torrents)
-            new_hashes = {t.hash.lower() for t in after} - before_hashes
-            if new_hashes:
-                self._managed_hashes.update(new_hashes)
+            if extracted_hash:
+                self._managed_hashes.add(extracted_hash)
                 await self._save_store()
-                _LOGGER.debug(
-                    "Tracked %d new managed hash(es) for folder-scoped sync: %s",
-                    len(new_hashes),
-                    new_hashes,
-                )
+                _LOGGER.debug("Tracked managed hash from magnet URI: %s", extracted_hash)
             else:
-                _LOGGER.warning(
-                    "Could not detect hash of newly added torrent '%s'; "
-                    "it may not be picked up by the scoped sync automatically",
-                    uri,
-                )
+                # Non-magnet fallback: diff list_torrents() before/after the add.
+                after = await self.hass.async_add_executor_job(self._list_all_torrents)
+                new_hashes = {t.hash.lower() for t in after} - before_hashes
+                if new_hashes:
+                    self._managed_hashes.update(new_hashes)
+                    await self._save_store()
+                    _LOGGER.debug(
+                        "Tracked %d new managed hash(es) for folder-scoped sync: %s",
+                        len(new_hashes),
+                        new_hashes,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Could not detect hash of newly added torrent '%s'; "
+                        "it may not be picked up by the scoped sync automatically",
+                        uri,
+                    )
