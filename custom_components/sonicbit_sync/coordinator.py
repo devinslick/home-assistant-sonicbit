@@ -94,6 +94,9 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             f"{DOMAIN}_completed_{entry.entry_id}",
         )
         self._completed_names: set[str] | None = None
+        # Hashes of torrents added via the add_torrent service; used to scope
+        # sync to only integration-managed torrents when a remote folder is set.
+        self._managed_hashes: set[str] | None = None
 
     # ------------------------------------------------------------------
     # SonicBit client – created once, reused thereafter
@@ -218,21 +221,16 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         completed = [t for t in all_torrents if t.progress == 100]
 
         if self._remote_folder and completed:
-            # Scope to only torrents present in the configured My Drive folder.
-            # The folder listing is the source of truth: only files that SonicBit
-            # has moved there (after completing) will be synced locally.
-            try:
-                folder_names = await self.hass.async_add_executor_job(
-                    self._list_remote_folder_names
-                )
-                completed = [t for t in completed if t.name in folder_names]
-            except Exception as err:
-                _LOGGER.warning(
-                    "Could not list remote folder '%s'; skipping sync this cycle: %s",
-                    self._remote_folder,
-                    err,
-                )
-                return
+            # Scope to only torrents that were added via this integration.
+            # We use the managed-hashes set (populated in async_add_torrent)
+            # rather than calling list_files(), which requires a different
+            # auth mechanism (web session cookie) that the SDK does not set.
+            if self._managed_hashes is None:
+                await self._load_completed_names()
+            completed = [
+                t for t in completed
+                if t.hash.lower() in (self._managed_hashes or set())
+            ]
 
         active_names = {t.name for t in all_torrents}
 
@@ -254,7 +252,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass.async_create_task(self._process_torrent(torrent))
 
     async def _load_completed_names(self) -> None:
-        """Load completed-download names from the persistent store.
+        """Load completed-download names and managed hashes from the persistent store.
 
         On the very first run (no store file yet) every existing local folder
         is treated as "completed" so that pre-existing downloads are not
@@ -263,9 +261,11 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data = await self._store.async_load()
         if data is not None:
             self._completed_names = set(data.get("names", []))
+            self._managed_hashes = set(data.get("managed_hashes", []))
             _LOGGER.debug(
-                "Loaded %d completed torrent name(s) from store",
+                "Loaded %d completed torrent name(s) and %d managed hash(es) from store",
                 len(self._completed_names),
+                len(self._managed_hashes),
             )
         else:
             # First run: seed from whatever is already on disk
@@ -273,11 +273,21 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._scan_local_folders
             )
             self._completed_names = existing
-            await self._store.async_save({"names": list(self._completed_names)})
+            self._managed_hashes = set()
+            await self._save_store()
             _LOGGER.debug(
                 "Initialised completed-downloads store with %d existing folder(s)",
                 len(self._completed_names),
             )
+
+    async def _save_store(self) -> None:
+        """Persist completed names and managed hashes to the store."""
+        await self._store.async_save(
+            {
+                "names": list(self._completed_names or set()),
+                "managed_hashes": list(self._managed_hashes or set()),
+            }
+        )
 
     async def _cleanup_stale_folders(self, active_names: set[str]) -> None:
         """Delete local folders for torrents no longer present on SonicBit.
@@ -411,9 +421,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # the list on the next poll so we must protect the folder now.
                 if self._completed_names is not None:
                     self._completed_names.add(torrent_name)
-                    await self._store.async_save(
-                        {"names": list(self._completed_names)}
-                    )
+                    await self._save_store()
             else:
                 _LOGGER.warning(
                     "One or more files failed for '%s'; cloud copy retained",
@@ -550,27 +558,6 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception:
             return set()
 
-    def _list_remote_folder_names(self) -> set[str]:
-        """Return names of items in the configured My Drive remote folder (blocking).
-
-        Navigates from root by display name rather than constructing a PathInfo
-        from the user-supplied string.  The ``list_files`` API requires the
-        server-assigned key embedded in each item's ``path_info``; using the
-        folder's display name as the key directly causes the server to return a
-        non-JSON response.
-        """
-        client = self._get_client()
-        root_items = client.list_files().items
-        for item in root_items:
-            if item.name == self._remote_folder and item.is_directory:
-                folder_contents = client.list_files(path=item.path_info)
-                return {f.name for f in folder_contents.items}
-        _LOGGER.debug(
-            "Remote folder '%s' not found in My Drive root; treating as empty",
-            self._remote_folder,
-        )
-        return set()
-
     def _add_torrent_uri(self, uri: str) -> None:
         """Add a torrent by magnet link or .torrent URL (blocking)."""
         from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
@@ -610,29 +597,23 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         and must be removed with an explicit list_files / delete_file call.
 
         Multi-file torrents land as a folder; single-file torrents land as a
-        bare file – both are handled by checking is_directory.  When a remote
-        folder is configured the listing is scoped to that folder; the folder
-        is located by display name from root so the server-assigned key is used.
+        bare file – both are handled by checking is_directory.
+
+        Note: the file-manager endpoint requires a web session cookie in
+        addition to the Bearer token.  If list_files() fails the deletion
+        is skipped gracefully – the queue entry was already removed and the
+        My Drive copy can be cleaned up manually.
         """
         client = self._get_client()
-
-        if self._remote_folder:
-            # Locate the remote folder by display name from root first.
-            root_items = client.list_files().items
-            remote_dir = next(
-                (f for f in root_items if f.name == self._remote_folder and f.is_directory),
-                None,
-            )
-            if remote_dir is None:
-                _LOGGER.debug(
-                    "Remote folder '%s' not found; cannot delete '%s'",
-                    self._remote_folder,
-                    torrent_name,
-                )
-                return
-            file_list = client.list_files(path=remote_dir.path_info)
-        else:
+        try:
             file_list = client.list_files()
+        except Exception as err:
+            _LOGGER.warning(
+                "Could not list My Drive to delete '%s'; skipping drive cleanup: %s",
+                torrent_name,
+                err,
+            )
+            return
 
         for item in file_list.items:
             if item.name == torrent_name:
@@ -644,9 +625,8 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
         _LOGGER.debug(
-            "No My Drive entry named '%s' found%s (already gone or path differs)",
+            "No My Drive entry named '%s' found at root (already gone or path differs)",
             torrent_name,
-            f" in folder '{self._remote_folder}'" if self._remote_folder else " at root",
         )
 
     # ------------------------------------------------------------------
@@ -679,11 +659,40 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         * Everything else (``magnet:`` links, ``http(s)://`` URLs) is passed
           directly to ``add_torrent``.
 
-        If a remote folder is configured the torrent is placed in that folder
-        on SonicBit's My Drive so the integration's folder-scoped sync picks
-        it up automatically.
+        When a remote folder is configured the torrent is placed in that folder
+        and its hash is recorded in ``_managed_hashes`` so the scoped sync loop
+        knows to process it.  Hash discovery uses a before/after diff of
+        list_torrents() which avoids the file-manager API entirely.
         """
+        # Ensure the persistent store is loaded before we might write to it.
+        if self._managed_hashes is None:
+            await self._load_completed_names()
+
+        # Snapshot existing hashes so we can detect the newly added one(s).
+        before_hashes: set[str] = set()
+        if self._remote_folder:
+            before = await self.hass.async_add_executor_job(self._list_all_torrents)
+            before_hashes = {t.hash.lower() for t in before}
+
         if uri.startswith("/"):
             await self.hass.async_add_executor_job(self._add_torrent_file, uri)
         else:
             await self.hass.async_add_executor_job(self._add_torrent_uri, uri)
+
+        if self._remote_folder:
+            after = await self.hass.async_add_executor_job(self._list_all_torrents)
+            new_hashes = {t.hash.lower() for t in after} - before_hashes
+            if new_hashes:
+                self._managed_hashes.update(new_hashes)
+                await self._save_store()
+                _LOGGER.debug(
+                    "Tracked %d new managed hash(es) for folder-scoped sync: %s",
+                    len(new_hashes),
+                    new_hashes,
+                )
+            else:
+                _LOGGER.warning(
+                    "Could not detect hash of newly added torrent '%s'; "
+                    "it may not be picked up by the scoped sync automatically",
+                    uri,
+                )
