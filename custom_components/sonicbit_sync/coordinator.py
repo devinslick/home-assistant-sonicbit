@@ -667,20 +667,18 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _delete_drive_entry(self, torrent_name: str) -> None:
         """Delete the torrent's file or folder from My Drive via the file manager API.
 
-        The /api/file-manager endpoint needs the web session cookie that is
-        populated by the session-based login performed in _get_client().  If the
-        session cookie has expired since the client was created, list_files() will
-        receive a non-JSON response (login redirect / empty body) and raise
-        InvalidResponseError.  In that case we re-authenticate and retry once.
+        Bypasses the SDK's ``list_files()`` because that call intermittently
+        receives an empty response body (while an identical raw GET to the same
+        URL with the same session returns valid JSON).  Instead we make the raw
+        HTTP request ourselves and parse the response directly.
 
         When a remote folder is configured, files are listed (and deleted) from
         that folder rather than the My Drive root.
         """
-        from sonicbit.errors import InvalidResponseError  # noqa: PLC0415
-        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
-
         import json as _json  # noqa: PLC0415
         from sonicbit.enums import FileCommand  # noqa: PLC0415
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
+        from sonicbit.types.path_info import PathInfo as PathInfoType  # noqa: PLC0415
 
         client = self._get_client()
 
@@ -695,101 +693,99 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else "root"
         )
 
-        # Build the same query the SDK would send so we can probe independently.
-        probe_params = {
+        params = {
             "arguments": _json.dumps({"pathInfo": list_path.serialized}),
             "command": FileCommand.GET_DIR_CONTENTS.value,
         }
 
-        def _probe_file_manager(label: str) -> None:
-            """Make a raw GET to /file-manager and log the full response."""
+        for attempt in (1, 2):
+            resp = None
             try:
-                probe = client.session.get(
-                    client.url("/file-manager"), params=probe_params
+                resp = client.session.get(
+                    client.url("/file-manager"), params=params
+                )
+
+                if resp.status_code >= 400:
+                    _LOGGER.warning(
+                        "file-manager returned HTTP %s on attempt %d for '%s'",
+                        resp.status_code,
+                        attempt,
+                        torrent_name,
+                    )
+                    if attempt == 1:
+                        self._refresh_web_session()
+                        continue
+                    return
+
+                json_data = resp.json()
+            except Exception as err:
+                body_len = len(resp.text) if resp is not None and resp.text else -1
+                body_preview = (
+                    resp.text[:200] if resp is not None and resp.text else "(no response)"
                 )
                 _LOGGER.warning(
-                    "file-manager probe [%s]: HTTP %s, content-type=%s, "
-                    "body_length=%d, body_preview=%.500s, cookies=%s, "
-                    "request_url=%s",
-                    label,
-                    probe.status_code,
-                    probe.headers.get("Content-Type", "(none)"),
-                    len(probe.text),
-                    probe.text[:500] if probe.text else "(empty)",
-                    dict(client.session.cookies),
-                    probe.url,
-                )
-            except Exception as probe_err:
-                _LOGGER.warning("file-manager probe [%s] failed: %s", label, probe_err)
-
-        # ---- Attempt 1 ----
-        _LOGGER.warning(
-            "_delete_drive_entry('%s'): cookies before first attempt: %s, "
-            "list_path serialized=%s, path_label=%s",
-            torrent_name,
-            dict(client.session.cookies),
-            list_path.serialized,
-            path_label,
-        )
-        _probe_file_manager("BEFORE list_files attempt 1")
-
-        try:
-            file_list = client.list_files(list_path)
-        except InvalidResponseError as first_err:
-            _LOGGER.warning(
-                "list_files(%s) failed (attempt 1): %s – refreshing web session",
-                path_label,
-                first_err,
-            )
-            ok = self._refresh_web_session()
-
-            _probe_file_manager("AFTER refresh, BEFORE list_files attempt 2")
-
-            if not ok:
-                _LOGGER.warning(
-                    "Could not list My Drive (%s) to delete '%s'; "
-                    "session refresh failed; skipping drive cleanup",
-                    path_label,
+                    "file-manager request/parse failed on attempt %d for '%s' "
+                    "in %s (body_length=%d, body=%.200s): %s",
+                    attempt,
                     torrent_name,
+                    path_label,
+                    body_len,
+                    body_preview,
+                    err,
                 )
+                if attempt == 1:
+                    self._refresh_web_session()
+                    continue
                 return
 
-            # ---- Attempt 2 ----
-            try:
-                file_list = client.list_files(list_path)
-            except Exception as second_err:
-                _LOGGER.warning(
-                    "Could not list My Drive (%s) to delete '%s'; "
-                    "skipping drive cleanup (attempt 2 also failed): %s",
-                    path_label,
-                    torrent_name,
-                    second_err,
-                )
-                return
-        except Exception as err:
-            _LOGGER.warning(
-                "Could not list My Drive (%s) to delete '%s'; skipping drive cleanup: %s",
-                path_label,
+            result_items = json_data.get("result", [])
+            for item_data in result_items:
+                if item_data.get("name") == torrent_name:
+                    is_dir = item_data.get("isDirectory", False)
+                    item_path_info = PathInfoType.from_list(
+                        item_data.get("data_drive_path", [])
+                    )
+
+                    delete_data = {
+                        "arguments": _json.dumps(
+                            {
+                                "pathInfo": item_path_info.serialized,
+                                "isDirectory": is_dir,
+                            }
+                        ),
+                        "command": FileCommand.REMOVE.value,
+                    }
+                    del_resp = client.session.post(
+                        client.url("/file-manager"), data=delete_data
+                    )
+                    try:
+                        del_ok = del_resp.json().get("success", False)
+                    except Exception:
+                        del_ok = False
+
+                    if del_ok:
+                        _LOGGER.info(
+                            "Deleted My Drive %s '%s' from %s",
+                            "folder" if is_dir else "file",
+                            torrent_name,
+                            path_label,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "Delete request for '%s' in %s returned: HTTP %s, body=%.200s",
+                            torrent_name,
+                            path_label,
+                            del_resp.status_code,
+                            del_resp.text[:200] if del_resp.text else "(empty)",
+                        )
+                    return
+
+            _LOGGER.debug(
+                "No My Drive entry named '%s' found at %s (already gone or path differs)",
                 torrent_name,
-                err,
+                path_label,
             )
             return
-
-        for item in file_list.items:
-            if item.name == torrent_name:
-                client.delete_file(item, is_directory=item.is_directory)
-                _LOGGER.debug(
-                    "Deleted My Drive %s '%s' from %s",
-                    "folder" if item.is_directory else "file",
-                    torrent_name,
-                    path_label,
-                )
-                return
-        _LOGGER.debug(
-            "No My Drive entry named '%s' found at %s (already gone or path differs)",
-            torrent_name,
-            path_label,
-        )
 
     # ------------------------------------------------------------------
     # Helpers
