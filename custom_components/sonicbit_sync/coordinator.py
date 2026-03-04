@@ -142,8 +142,9 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if self._client is None:
             return False
-        from sonicbit.base import SonicBitBase  # noqa: PLC0415
         from sonicbit.constants import Constants  # noqa: PLC0415
+
+        login_url = self._client.url("/web/login")
 
         # Stale / expired cookies can confuse the server, so drop them before
         # re-authenticating.
@@ -151,7 +152,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             resp = self._client.session.post(
-                SonicBitBase.url("/web/login"),
+                login_url,
                 json={"email": self._email, "password": self._password},
                 headers=Constants.API_HEADERS,
             )
