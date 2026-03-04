@@ -142,6 +142,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if self._client is None:
             return False
+        from sonicbit.base import SonicBitBase  # noqa: PLC0415
         from sonicbit.constants import Constants  # noqa: PLC0415
 
         # Stale / expired cookies can confuse the server, so drop them before
