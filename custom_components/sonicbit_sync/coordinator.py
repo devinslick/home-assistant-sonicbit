@@ -156,34 +156,35 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 json={"email": self._email, "password": self._password},
                 headers=Constants.API_HEADERS,
             )
+
+            status = resp.status_code
+            if status >= 400:
+                _LOGGER.warning(
+                    "Web session login returned HTTP %s – cookie may not be set",
+                    status,
+                )
+                return False
+
+            if not self._client.session.cookies:
+                _LOGGER.warning(
+                    "Web session login returned HTTP %s but set no cookies; "
+                    "file-manager calls will likely fail",
+                    status,
+                )
+                return False
+
+            _LOGGER.debug(
+                "Web session cookie refreshed (HTTP %s, %d cookie(s))",
+                status,
+                len(self._client.session.cookies),
+            )
+            return True
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "Web session refresh request failed: %s",
                 err,
             )
             return False
-
-        if not resp.ok:
-            _LOGGER.warning(
-                "Web session login returned HTTP %s – cookie may not be set",
-                resp.status_code,
-            )
-            return False
-
-        if not self._client.session.cookies:
-            _LOGGER.warning(
-                "Web session login returned HTTP %s but set no cookies; "
-                "file-manager calls will likely fail",
-                resp.status_code,
-            )
-            return False
-
-        _LOGGER.debug(
-            "Web session cookie refreshed (HTTP %s, %d cookie(s))",
-            resp.status_code,
-            len(self._client.session.cookies),
-        )
-        return True
 
     @staticmethod
     def _patch_sonicbit_models() -> None:
