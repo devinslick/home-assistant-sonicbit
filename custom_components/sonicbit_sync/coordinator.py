@@ -679,6 +679,9 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         from sonicbit.errors import InvalidResponseError  # noqa: PLC0415
         from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
 
+        import json as _json  # noqa: PLC0415
+        from sonicbit.enums import FileCommand  # noqa: PLC0415
+
         client = self._get_client()
 
         list_path = (
@@ -692,69 +695,77 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else "root"
         )
 
-        def _list_with_session_retry():
-            """Call list_files(); on InvalidResponseError refresh the session and retry."""
+        # Build the same query the SDK would send so we can probe independently.
+        probe_params = {
+            "arguments": _json.dumps({"pathInfo": list_path.serialized}),
+            "command": FileCommand.GET_DIR_CONTENTS.value,
+        }
+
+        def _probe_file_manager(label: str) -> None:
+            """Make a raw GET to /file-manager and log the full response."""
             try:
-                return client.list_files(list_path)
-            except InvalidResponseError as first_err:
-                # Manually probe the file-manager endpoint to capture the raw
-                # response for debugging before we attempt a session refresh.
-                import json as _json  # noqa: PLC0415
-                from sonicbit.enums import FileCommand  # noqa: PLC0415
-
-                probe_params = {
-                    "arguments": _json.dumps({"pathInfo": list_path.serialized}),
-                    "command": FileCommand.GET_DIR_CONTENTS.value,
-                }
-                try:
-                    probe = client.session.get(
-                        client.url("/file-manager"), params=probe_params
-                    )
-                    _LOGGER.debug(
-                        "file-manager probe BEFORE refresh: HTTP %s, "
-                        "content-type=%s, body_length=%d, body_preview=%.300s, "
-                        "cookies=%s",
-                        probe.status_code,
-                        probe.headers.get("Content-Type", "(none)"),
-                        len(probe.text),
-                        probe.text[:300] if probe.text else "(empty)",
-                        dict(client.session.cookies),
-                    )
-                except Exception as probe_err:
-                    _LOGGER.debug("file-manager probe failed: %s", probe_err)
-
-                _LOGGER.debug(
-                    "list_files(%s) returned invalid JSON – session cookie likely "
-                    "expired; refreshing web session and retrying: %s",
-                    path_label,
-                    first_err,
+                probe = client.session.get(
+                    client.url("/file-manager"), params=probe_params
                 )
-                ok = self._refresh_web_session()
-                if not ok:
-                    raise  # re-raise the original error; session refresh itself failed
+                _LOGGER.warning(
+                    "file-manager probe [%s]: HTTP %s, content-type=%s, "
+                    "body_length=%d, body_preview=%.500s, cookies=%s, "
+                    "request_url=%s",
+                    label,
+                    probe.status_code,
+                    probe.headers.get("Content-Type", "(none)"),
+                    len(probe.text),
+                    probe.text[:500] if probe.text else "(empty)",
+                    dict(client.session.cookies),
+                    probe.url,
+                )
+            except Exception as probe_err:
+                _LOGGER.warning("file-manager probe [%s] failed: %s", label, probe_err)
 
-                # Probe again after refresh
-                try:
-                    probe2 = client.session.get(
-                        client.url("/file-manager"), params=probe_params
-                    )
-                    _LOGGER.debug(
-                        "file-manager probe AFTER refresh: HTTP %s, "
-                        "content-type=%s, body_length=%d, body_preview=%.300s, "
-                        "cookies=%s",
-                        probe2.status_code,
-                        probe2.headers.get("Content-Type", "(none)"),
-                        len(probe2.text),
-                        probe2.text[:300] if probe2.text else "(empty)",
-                        dict(client.session.cookies),
-                    )
-                except Exception as probe_err:
-                    _LOGGER.debug("file-manager probe after refresh failed: %s", probe_err)
-
-                return client.list_files(list_path)  # let any second failure propagate
+        # ---- Attempt 1 ----
+        _LOGGER.warning(
+            "_delete_drive_entry('%s'): cookies before first attempt: %s, "
+            "list_path serialized=%s, path_label=%s",
+            torrent_name,
+            dict(client.session.cookies),
+            list_path.serialized,
+            path_label,
+        )
+        _probe_file_manager("BEFORE list_files attempt 1")
 
         try:
-            file_list = _list_with_session_retry()
+            file_list = client.list_files(list_path)
+        except InvalidResponseError as first_err:
+            _LOGGER.warning(
+                "list_files(%s) failed (attempt 1): %s – refreshing web session",
+                path_label,
+                first_err,
+            )
+            ok = self._refresh_web_session()
+
+            _probe_file_manager("AFTER refresh, BEFORE list_files attempt 2")
+
+            if not ok:
+                _LOGGER.warning(
+                    "Could not list My Drive (%s) to delete '%s'; "
+                    "session refresh failed; skipping drive cleanup",
+                    path_label,
+                    torrent_name,
+                )
+                return
+
+            # ---- Attempt 2 ----
+            try:
+                file_list = client.list_files(list_path)
+            except Exception as second_err:
+                _LOGGER.warning(
+                    "Could not list My Drive (%s) to delete '%s'; "
+                    "skipping drive cleanup (attempt 2 also failed): %s",
+                    path_label,
+                    torrent_name,
+                    second_err,
+                )
+                return
         except Exception as err:
             _LOGGER.warning(
                 "Could not list My Drive (%s) to delete '%s'; skipping drive cleanup: %s",
