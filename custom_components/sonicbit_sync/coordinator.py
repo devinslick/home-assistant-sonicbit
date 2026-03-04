@@ -130,29 +130,58 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._refresh_web_session()
         return self._client
 
-    def _refresh_web_session(self) -> None:
+    def _refresh_web_session(self) -> bool:
         """(Re-)authenticate the web session cookie used by /api/file-manager.
 
         Called once during client initialisation and again whenever the session
         cookie appears to have expired (detected by an InvalidResponseError from
         list_files()).  Must be called from an executor thread only.
+
+        Returns True when the login appears successful (2xx status and at least
+        one cookie was set), False otherwise.
         """
         if self._client is None:
-            return
+            return False
         from sonicbit.constants import Constants  # noqa: PLC0415
 
+        # Stale / expired cookies can confuse the server, so drop them before
+        # re-authenticating.
+        self._client.session.cookies.clear()
+
         try:
-            self._client.session.post(
+            resp = self._client.session.post(
                 SonicBitBase.url("/web/login"),
                 json={"email": self._email, "password": self._password},
                 headers=Constants.API_HEADERS,
             )
-            _LOGGER.debug("Web session cookie refreshed successfully")
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug(
-                "Web session refresh failed (non-fatal, Bearer token still works): %s",
+            _LOGGER.warning(
+                "Web session refresh request failed: %s",
                 err,
             )
+            return False
+
+        if not resp.ok:
+            _LOGGER.warning(
+                "Web session login returned HTTP %s – cookie may not be set",
+                resp.status_code,
+            )
+            return False
+
+        if not self._client.session.cookies:
+            _LOGGER.warning(
+                "Web session login returned HTTP %s but set no cookies; "
+                "file-manager calls will likely fail",
+                resp.status_code,
+            )
+            return False
+
+        _LOGGER.debug(
+            "Web session cookie refreshed (HTTP %s, %d cookie(s))",
+            resp.status_code,
+            len(self._client.session.cookies),
+        )
+        return True
 
     @staticmethod
     def _patch_sonicbit_models() -> None:
@@ -631,28 +660,48 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         session cookie has expired since the client was created, list_files() will
         receive a non-JSON response (login redirect / empty body) and raise
         InvalidResponseError.  In that case we re-authenticate and retry once.
+
+        When a remote folder is configured, files are listed (and deleted) from
+        that folder rather than the My Drive root.
         """
         from sonicbit.errors import InvalidResponseError  # noqa: PLC0415
+        from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
 
         client = self._get_client()
 
-        def _list_with_session_retry() -> object:
+        list_path = (
+            PathInfo.from_path_key(self._remote_folder)
+            if self._remote_folder
+            else PathInfo.root()
+        )
+        path_label = (
+            f"folder '{self._remote_folder}'"
+            if self._remote_folder
+            else "root"
+        )
+
+        def _list_with_session_retry():
             """Call list_files(); on InvalidResponseError refresh the session and retry."""
             try:
-                return client.list_files()
-            except InvalidResponseError:
+                return client.list_files(list_path)
+            except InvalidResponseError as first_err:
                 _LOGGER.debug(
-                    "list_files() returned invalid JSON – session cookie likely expired; "
-                    "refreshing web session and retrying"
+                    "list_files(%s) returned invalid JSON – session cookie likely "
+                    "expired; refreshing web session and retrying: %s",
+                    path_label,
+                    first_err,
                 )
-                self._refresh_web_session()
-                return client.list_files()  # let any second failure propagate
+                ok = self._refresh_web_session()
+                if not ok:
+                    raise  # re-raise the original error; session refresh itself failed
+                return client.list_files(list_path)  # let any second failure propagate
 
         try:
             file_list = _list_with_session_retry()
         except Exception as err:
             _LOGGER.warning(
-                "Could not list My Drive to delete '%s'; skipping drive cleanup: %s",
+                "Could not list My Drive (%s) to delete '%s'; skipping drive cleanup: %s",
+                path_label,
                 torrent_name,
                 err,
             )
@@ -662,14 +711,16 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if item.name == torrent_name:
                 client.delete_file(item, is_directory=item.is_directory)
                 _LOGGER.debug(
-                    "Deleted My Drive %s '%s'",
+                    "Deleted My Drive %s '%s' from %s",
                     "folder" if item.is_directory else "file",
                     torrent_name,
+                    path_label,
                 )
                 return
         _LOGGER.debug(
-            "No My Drive entry named '%s' found at root (already gone or path differs)",
+            "No My Drive entry named '%s' found at %s (already gone or path differs)",
             torrent_name,
+            path_label,
         )
 
     # ------------------------------------------------------------------
