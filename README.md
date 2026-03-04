@@ -104,4 +104,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 
-Uses the unofficial [sonicbit](https://github.com/devinslick/sonicbit-python-sdk) Python SDK by [devinslick](https://github.com/devinslick/sonicbit-python-sdk).
+Built on the [sonicbit-python-sdk](https://github.com/viperadnan-git/sonicbit-python-sdk) by [@viperadnan-git](https://github.com/viperadnan-git).
