@@ -158,6 +158,15 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
             status = resp.status_code
+            _LOGGER.debug(
+                "Web session login response: HTTP %s, cookies=%s, "
+                "Set-Cookie header=%s, body_length=%d, body_preview=%.200s",
+                status,
+                dict(self._client.session.cookies),
+                resp.headers.get("Set-Cookie", "(none)"),
+                len(resp.text),
+                resp.text[:200] if resp.text else "(empty)",
+            )
             if status >= 400:
                 _LOGGER.warning(
                     "Web session login returned HTTP %s – cookie may not be set",
@@ -688,6 +697,32 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 return client.list_files(list_path)
             except InvalidResponseError as first_err:
+                # Manually probe the file-manager endpoint to capture the raw
+                # response for debugging before we attempt a session refresh.
+                import json as _json  # noqa: PLC0415
+                from sonicbit.enums import FileCommand  # noqa: PLC0415
+
+                probe_params = {
+                    "arguments": _json.dumps({"pathInfo": list_path.serialized}),
+                    "command": FileCommand.GET_DIR_CONTENTS.value,
+                }
+                try:
+                    probe = client.session.get(
+                        client.url("/file-manager"), params=probe_params
+                    )
+                    _LOGGER.debug(
+                        "file-manager probe BEFORE refresh: HTTP %s, "
+                        "content-type=%s, body_length=%d, body_preview=%.300s, "
+                        "cookies=%s",
+                        probe.status_code,
+                        probe.headers.get("Content-Type", "(none)"),
+                        len(probe.text),
+                        probe.text[:300] if probe.text else "(empty)",
+                        dict(client.session.cookies),
+                    )
+                except Exception as probe_err:
+                    _LOGGER.debug("file-manager probe failed: %s", probe_err)
+
                 _LOGGER.debug(
                     "list_files(%s) returned invalid JSON – session cookie likely "
                     "expired; refreshing web session and retrying: %s",
@@ -697,6 +732,25 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ok = self._refresh_web_session()
                 if not ok:
                     raise  # re-raise the original error; session refresh itself failed
+
+                # Probe again after refresh
+                try:
+                    probe2 = client.session.get(
+                        client.url("/file-manager"), params=probe_params
+                    )
+                    _LOGGER.debug(
+                        "file-manager probe AFTER refresh: HTTP %s, "
+                        "content-type=%s, body_length=%d, body_preview=%.300s, "
+                        "cookies=%s",
+                        probe2.status_code,
+                        probe2.headers.get("Content-Type", "(none)"),
+                        len(probe2.text),
+                        probe2.text[:300] if probe2.text else "(empty)",
+                        dict(client.session.cookies),
+                    )
+                except Exception as probe_err:
+                    _LOGGER.debug("file-manager probe after refresh failed: %s", probe_err)
+
                 return client.list_files(list_path)  # let any second failure propagate
 
         try:
