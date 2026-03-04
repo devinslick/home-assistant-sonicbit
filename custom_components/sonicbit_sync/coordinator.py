@@ -158,15 +158,6 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
             status = resp.status_code
-            _LOGGER.debug(
-                "Web session login response: HTTP %s, cookies=%s, "
-                "Set-Cookie header=%s, body_length=%d, body_preview=%.200s",
-                status,
-                dict(self._client.session.cookies),
-                resp.headers.get("Set-Cookie", "(none)"),
-                len(resp.text),
-                resp.text[:200] if resp.text else "(empty)",
-            )
             if status >= 400:
                 _LOGGER.warning(
                     "Web session login returned HTTP %s – cookie may not be set",
@@ -705,7 +696,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
                 if resp.status_code >= 400:
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "file-manager returned HTTP %s on attempt %d for '%s'",
                         resp.status_code,
                         attempt,
@@ -718,18 +709,13 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 json_data = resp.json()
             except Exception as err:
-                body_len = len(resp.text) if resp is not None and resp.text else -1
-                body_preview = (
-                    resp.text[:200] if resp is not None and resp.text else "(no response)"
-                )
-                _LOGGER.warning(
+
+                _LOGGER.debug(
                     "file-manager request/parse failed on attempt %d for '%s' "
-                    "in %s (body_length=%d, body=%.200s): %s",
+                    "in %s: %s",
                     attempt,
                     torrent_name,
                     path_label,
-                    body_len,
-                    body_preview,
                     err,
                 )
                 if attempt == 1:
@@ -765,7 +751,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         del_ok = False
 
                     if del_ok:
-                        _LOGGER.info(
+                        _LOGGER.debug(
                             "Deleted My Drive %s '%s' from %s",
                             "folder" if is_dir else "file",
                             torrent_name,
@@ -773,11 +759,10 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                     else:
                         _LOGGER.warning(
-                            "Delete request for '%s' in %s returned: HTTP %s, body=%.200s",
+                            "Delete request for '%s' in %s failed (HTTP %s)",
                             torrent_name,
                             path_label,
                             del_resp.status_code,
-                            del_resp.text[:200] if del_resp.text else "(empty)",
                         )
                     return
 
