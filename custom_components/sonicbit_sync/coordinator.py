@@ -678,7 +678,6 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         import json as _json  # noqa: PLC0415
         from sonicbit.enums import FileCommand  # noqa: PLC0415
         from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
-        from sonicbit.types.path_info import PathInfo as PathInfoType  # noqa: PLC0415
 
         client = self._get_client()
 
@@ -742,14 +741,16 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for item_data in result_items:
                 if item_data.get("name") == torrent_name:
                     is_dir = item_data.get("isDirectory", False)
-                    item_path_info = PathInfoType.from_list(
-                        item_data.get("data_drive_path", [])
-                    )
+                    # Use the raw path list directly – PathInfo.serialized
+                    # just returns the raw list, so no need to construct an
+                    # object (and avoids importing sonicbit.types which may
+                    # not exist on all SDK versions).
+                    raw_path = item_data.get("data_drive_path", [])
 
                     delete_data = {
                         "arguments": _json.dumps(
                             {
-                                "pathInfo": item_path_info.serialized,
+                                "pathInfo": raw_path,
                                 "isDirectory": is_dir,
                             }
                         ),
