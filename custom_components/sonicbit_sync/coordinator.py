@@ -109,7 +109,6 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if self._client is None:
             from sonicbit import SonicBit  # noqa: PLC0415
-            from sonicbit.constants import Constants  # noqa: PLC0415
 
             self._patch_sonicbit_models()
             handler = HATokenHandler(
@@ -121,70 +120,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 password=self._password,
                 token_handler=handler,
             )
-            # Auth.login() is a @staticmethod that uses a one-off httpx.request()
-            # call, so the server's Set-Cookie headers are never stored in the
-            # shared httpx.Client session.  The /api/file-manager endpoint needs
-            # those cookies.  Repeating the login through self._client.session
-            # populates the cookie jar; the requests.Session then sends the
-            # cookies automatically on every subsequent request to the same origin.
-            self._refresh_web_session()
         return self._client
-
-    def _refresh_web_session(self) -> bool:
-        """(Re-)authenticate the web session cookie used by /api/file-manager.
-
-        Called once during client initialisation and again whenever the session
-        cookie appears to have expired (detected by an InvalidResponseError from
-        list_files()).  Must be called from an executor thread only.
-
-        Returns True when the login appears successful (2xx status and at least
-        one cookie was set), False otherwise.
-        """
-        if self._client is None:
-            return False
-        from sonicbit.constants import Constants  # noqa: PLC0415
-
-        login_url = self._client.url("/web/login")
-
-        # Stale / expired cookies can confuse the server, so drop them before
-        # re-authenticating.
-        self._client.session.cookies.clear()
-
-        try:
-            resp = self._client.session.post(
-                login_url,
-                json={"email": self._email, "password": self._password},
-                headers=Constants.API_HEADERS,
-            )
-
-            status = resp.status_code
-            if status >= 400:
-                _LOGGER.warning(
-                    "Web session login returned HTTP %s – cookie may not be set",
-                    status,
-                )
-                return False
-
-            if not self._client.session.cookies:
-                _LOGGER.warning(
-                    "Web session login returned HTTP %s but set no cookies; "
-                    "file-manager calls will likely fail",
-                    status,
-                )
-                return False
-
-            _LOGGER.debug(
-                "Web session cookie refreshed (HTTP %s, %d cookie(s))",
-                status,
-                len(self._client.session.cookies),
-            )
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning(
-                "Web session refresh request failed: %s",
-                err,
-            )
-            return False
 
     @staticmethod
     def _patch_sonicbit_models() -> None:
@@ -658,10 +594,13 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _delete_drive_entry(self, torrent_name: str) -> None:
         """Delete the torrent's file or folder from My Drive via the file manager API.
 
-        Bypasses the SDK's ``list_files()`` because that call intermittently
-        receives an empty response body (while an identical raw GET to the same
-        URL with the same session returns valid JSON).  Instead we make the raw
-        HTTP request ourselves and parse the response directly.
+        Bypasses the SDK's ``list_files()`` / ``delete_file()`` because
+        ``list_files()`` intermittently receives an empty response body (SDK
+        Issue 2) while an identical raw GET to the same URL with the same
+        session returns valid JSON.  We make raw HTTP requests and parse
+        the response directly until the SDK bug is resolved.
+
+        On transient failure the request is retried once after a brief delay.
 
         When a remote folder is configured, files are listed (and deleted) from
         that folder rather than the My Drive root.
@@ -703,13 +642,12 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         torrent_name,
                     )
                     if attempt == 1:
-                        self._refresh_web_session()
+                        time.sleep(2)
                         continue
                     return
 
                 json_data = resp.json()
             except Exception as err:
-
                 _LOGGER.debug(
                     "file-manager request/parse failed on attempt %d for '%s' "
                     "in %s: %s",
@@ -719,7 +657,7 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     err,
                 )
                 if attempt == 1:
-                    self._refresh_web_session()
+                    time.sleep(2)
                     continue
                 return
 
