@@ -594,19 +594,9 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _delete_drive_entry(self, torrent_name: str) -> None:
         """Delete the torrent's file or folder from My Drive via the file manager API.
 
-        Bypasses the SDK's ``list_files()`` / ``delete_file()`` because
-        ``list_files()`` intermittently receives an empty response body (SDK
-        Issue 2) while an identical raw GET to the same URL with the same
-        session returns valid JSON.  We make raw HTTP requests and parse
-        the response directly until the SDK bug is resolved.
-
-        On transient failure the request is retried once after a brief delay.
-
         When a remote folder is configured, files are listed (and deleted) from
         that folder rather than the My Drive root.
         """
-        import json as _json  # noqa: PLC0415
-        from sonicbit.enums import FileCommand  # noqa: PLC0415
         from sonicbit.models.path_info import PathInfo  # noqa: PLC0415
 
         client = self._get_client()
@@ -622,94 +612,50 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else "root"
         )
 
-        params = {
-            "arguments": _json.dumps({"pathInfo": list_path.serialized}),
-            "command": FileCommand.GET_DIR_CONTENTS.value,
-        }
-
-        for attempt in (1, 2):
-            resp = None
-            try:
-                resp = client.session.get(
-                    client.url("/file-manager"), params=params
-                )
-
-                if resp.status_code >= 400:
-                    _LOGGER.debug(
-                        "file-manager returned HTTP %s on attempt %d for '%s'",
-                        resp.status_code,
-                        attempt,
-                        torrent_name,
-                    )
-                    if attempt == 1:
-                        time.sleep(2)
-                        continue
-                    return
-
-                json_data = resp.json()
-            except Exception as err:
-                _LOGGER.debug(
-                    "file-manager request/parse failed on attempt %d for '%s' "
-                    "in %s: %s",
-                    attempt,
-                    torrent_name,
-                    path_label,
-                    err,
-                )
-                if attempt == 1:
-                    time.sleep(2)
-                    continue
-                return
-
-            result_items = json_data.get("result", [])
-            for item_data in result_items:
-                if item_data.get("name") == torrent_name:
-                    is_dir = item_data.get("isDirectory", False)
-                    # Use the raw path list directly – PathInfo.serialized
-                    # just returns the raw list, so no need to construct an
-                    # object (and avoids importing sonicbit.types which may
-                    # not exist on all SDK versions).
-                    raw_path = item_data.get("data_drive_path", [])
-
-                    delete_data = {
-                        "arguments": _json.dumps(
-                            {
-                                "pathInfo": raw_path,
-                                "isDirectory": is_dir,
-                            }
-                        ),
-                        "command": FileCommand.REMOVE.value,
-                    }
-                    del_resp = client.session.post(
-                        client.url("/file-manager"), data=delete_data
-                    )
-                    try:
-                        del_ok = del_resp.json().get("success", False)
-                    except Exception:
-                        del_ok = False
-
-                    if del_ok:
-                        _LOGGER.debug(
-                            "Deleted My Drive %s '%s' from %s",
-                            "folder" if is_dir else "file",
-                            torrent_name,
-                            path_label,
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "Delete request for '%s' in %s failed (HTTP %s)",
-                            torrent_name,
-                            path_label,
-                            del_resp.status_code,
-                        )
-                    return
-
+        try:
+            file_list = client.list_files(list_path)
+        except Exception as err:
             _LOGGER.debug(
-                "No My Drive entry named '%s' found at %s (already gone or path differs)",
+                "file-manager list request failed for '%s' in %s: %s",
                 torrent_name,
                 path_label,
+                err,
             )
             return
+
+        for item in file_list.result:
+            if item.name == torrent_name:
+                try:
+                    ok = client.delete_file(item, is_directory=item.is_directory)
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Delete request for '%s' in %s failed: %s",
+                        torrent_name,
+                        path_label,
+                        err,
+                    )
+                    return
+
+                if ok:
+                    _LOGGER.debug(
+                        "Deleted My Drive %s '%s' from %s",
+                        "folder" if item.is_directory else "file",
+                        torrent_name,
+                        path_label,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Delete request for '%s' in %s returned failure",
+                        torrent_name,
+                        path_label,
+                    )
+                return
+
+        _LOGGER.debug(
+            "No My Drive entry named '%s' found at %s (already gone or path differs)",
+            torrent_name,
+            path_label,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
