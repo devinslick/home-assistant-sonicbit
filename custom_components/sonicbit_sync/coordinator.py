@@ -124,38 +124,15 @@ class SonicBitCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @staticmethod
     def _patch_sonicbit_models() -> None:
-        """Work around sonicbit's TorrentInfo.upload_rate being typed as str
-        while the live API returns int or float values.
+        """Apply sonicbit SDK compatibility patches before the client is used.
 
-        TorrentList.from_response constructs TorrentInfo via __init__ keyword
-        arguments, passing upload_rate directly from the raw JSON (which can be
-        an int like 0).  We wrap __init__ to coerce numeric upload_rate values
-        to str before Pydantic's compiled validator runs.  This is more
-        reliable than trying to mutate model_config or __annotations__ and
-        calling model_rebuild, because model_rebuild does not always update the
-        compiled __pydantic_validator__ for already-defined fields.
+        Delegates to :func:`.compat.apply_sonicbit_patches` which patches all
+        known model fields where the live API returns a different type than the
+        SDK model declares (e.g. int instead of str).
         """
-        try:
-            import functools  # noqa: PLC0415
+        from .compat import apply_sonicbit_patches  # noqa: PLC0415
 
-            from sonicbit.models.torrent import torrent_info as _ti  # noqa: PLC0415
-
-            cls = _ti.TorrentInfo
-            if getattr(cls, "_upload_rate_coerce_patched", False):
-                return
-
-            original_init = cls.__init__
-
-            @functools.wraps(original_init)
-            def _patched_init(self, *args, **kwargs):
-                if isinstance(kwargs.get("upload_rate"), (int, float)):
-                    kwargs["upload_rate"] = str(kwargs["upload_rate"])
-                original_init(self, *args, **kwargs)
-
-            cls.__init__ = _patched_init
-            cls._upload_rate_coerce_patched = True  # type: ignore[attr-defined]
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("Could not patch sonicbit TorrentInfo model: %s", exc)
+        apply_sonicbit_patches()
 
     # ------------------------------------------------------------------
     # DataUpdateCoordinator hook – runs every POLL_INTERVAL seconds

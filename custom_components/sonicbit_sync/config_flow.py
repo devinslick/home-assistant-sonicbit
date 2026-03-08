@@ -39,8 +39,10 @@ def _test_credentials(email: str, password: str, config_dir: str) -> None:
     """
     from sonicbit import SonicBit  # noqa: PLC0415
 
+    from .compat import apply_sonicbit_patches  # noqa: PLC0415
     from .token_handler import HATokenHandler
 
+    apply_sonicbit_patches()
     handler = HATokenHandler(config_dir, "validation")
     client = SonicBit(email=email, password=password, token_handler=handler)
     # A lightweight call to confirm credentials are accepted
